@@ -1,0 +1,8 @@
+# SI-BERSIH — Sistem Intelijen Berbasis Evaluasi Respons Sampah
+pandas>=2.2
+streamlit>=1.50
+plotly>=5.24
+google-genai>=1.0        # Gemini API (SDK resmi terbaru)
+openai>=1.40             # opsional: GPT / DeepSeek / Grok untuk perbandingan model
+python-dotenv>=1.0       # membaca API key dari file .env
+matplotlib>=3.8          # membuat gambar fishbone diagram

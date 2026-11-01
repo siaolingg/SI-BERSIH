@@ -62,25 +62,37 @@ FISHBONE_PATH = BASE_DIR / "fishbone_sibersih.png"
 NAMA_SISTEM = "SI-BERSIH"
 KEPANJANGAN = "Sistem Intelijen Berbasis Evaluasi Respons Sampah"
 
+def _pengaturan(nama: str, default: str) -> str:
+    """Baca pengaturan dari .env (lokal) atau menu Secrets Streamlit Community Cloud (versi web)."""
+    if os.getenv(nama):
+        return os.getenv(nama)
+    try:
+        import streamlit as st
+
+        return str(st.secrets.get(nama) or default)
+    except Exception:  # noqa: BLE001 - tidak ada secrets.toml saat dijalankan lokal / lewat CLI
+        return default
+
+
 # >>> PLACEHOLDER API KEY <<<
-# Cara 1 (disarankan): salin .env.example menjadi .env lalu isi key di sana.
-# Cara 2: ganti teks "MASUKKAN_..." di bawah ini (jangan unggah key ke publik/GitHub).
-# Cara 3: tempel key di sidebar dashboard (Pengaturan LLM).
+# Cara 1 (lokal, disarankan): salin .env.example menjadi .env lalu isi key di sana.
+# Cara 2 (web/Streamlit Cloud): isi GEMINI_API_KEY di menu Settings → Secrets aplikasi.
+# Cara 3: tempel key di sidebar aplikasi (⚙️ Pengaturan AI). Jangan unggah key ke GitHub.
 API_KEYS = {
-    "Gemini": os.getenv("GEMINI_API_KEY", "MASUKKAN_API_KEY_GEMINI_DI_SINI"),
-    "OpenAI (GPT)": os.getenv("OPENAI_API_KEY", "MASUKKAN_API_KEY_OPENAI_DI_SINI"),
-    "DeepSeek": os.getenv("DEEPSEEK_API_KEY", "MASUKKAN_API_KEY_DEEPSEEK_DI_SINI"),
-    "Grok (xAI)": os.getenv("XAI_API_KEY", "MASUKKAN_API_KEY_XAI_DI_SINI"),
+    "Gemini": _pengaturan("GEMINI_API_KEY", "MASUKKAN_API_KEY_GEMINI_DI_SINI"),
+    "OpenAI (GPT)": _pengaturan("OPENAI_API_KEY", "MASUKKAN_API_KEY_OPENAI_DI_SINI"),
+    "DeepSeek": _pengaturan("DEEPSEEK_API_KEY", "MASUKKAN_API_KEY_DEEPSEEK_DI_SINI"),
+    "Grok (xAI)": _pengaturan("XAI_API_KEY", "MASUKKAN_API_KEY_XAI_DI_SINI"),
 }
 
 OFFLINE = "Offline (rule-based)"
 
-# Nama model bisa diganti lewat .env bila Google/penyedia lain mengganti versi model.
+# Nama model bisa diganti lewat .env/Secrets bila Google/penyedia lain mengganti versi model.
 PROVIDERS = {
-    "Gemini": {"model": os.getenv("GEMINI_MODEL", "gemini-flash-latest"), "base_url": None},
-    "OpenAI (GPT)": {"model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"), "base_url": None},
-    "DeepSeek": {"model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"), "base_url": "https://api.deepseek.com"},
-    "Grok (xAI)": {"model": os.getenv("XAI_MODEL", "grok-3-mini"), "base_url": "https://api.x.ai/v1"},
+    "Gemini": {"model": _pengaturan("GEMINI_MODEL", "gemini-flash-latest"), "base_url": None},
+    "OpenAI (GPT)": {"model": _pengaturan("OPENAI_MODEL", "gpt-4o-mini"), "base_url": None},
+    "DeepSeek": {"model": _pengaturan("DEEPSEEK_MODEL", "deepseek-chat"), "base_url": "https://api.deepseek.com"},
+    "Grok (xAI)": {"model": _pengaturan("XAI_MODEL", "grok-3-mini"), "base_url": "https://api.x.ai/v1"},
     OFFLINE: {"model": "rule-based", "base_url": None},
 }
 
@@ -967,6 +979,14 @@ def _panggil_openai_compatible(cfg: LLMConfig, system: str, prompt: str) -> str:
     return resp.choices[0].message.content
 
 
+def _kuota_harian_habis(error) -> bool:
+    pesan = str(error).lower()
+    return any(indikator in pesan for indikator in (
+        "per day limit exceeded", "requestsperday", "requests_per_day",
+        "generate_content_free_tier_requests",
+    ))
+
+
 def panggil_llm(cfg: LLMConfig, system: str, prompt: str, percobaan: int = 3):
     """Panggil LLM dan kembalikan JSON hasil parsing. Retry dengan backoff untuk rate limit (429)."""
     fungsi = _panggil_gemini if cfg.provider == "Gemini" else _panggil_openai_compatible
@@ -977,6 +997,8 @@ def panggil_llm(cfg: LLMConfig, system: str, prompt: str, percobaan: int = 3):
         except Exception as e:  # noqa: BLE001 - error SDK berbeda-beda tiap provider
             error_terakhir = e
             pesan = str(e).lower()
+            if _kuota_harian_habis(pesan):
+                break  # kuota harian tidak bisa pulih dengan retry
             if any(s in pesan for s in ("api key", "api_key", "401", "403", "permission", "not found", "404")):
                 break  # kesalahan konfigurasi: tidak ada gunanya mengulang
             time.sleep((20 if "429" in pesan or "quota" in pesan or "rate" in pesan else 3) * (i + 1))
@@ -1371,7 +1393,8 @@ def proses_batch(df: pd.DataFrame, cfg: LLMConfig, batch_size: int = 10, jeda: f
                  limit: int | None = None, output: Path = HASIL_PATH, lanjutkan: bool = True,
                  progress=None) -> pd.DataFrame:
     """Analisis dataset per kelompok (batch) agar hemat kuota API. Hasil disimpan bertahap sehingga
-    proses yang terputus (mis. kuota habis) bisa dilanjutkan tanpa mengulang dari awal."""
+    proses yang terputus bisa dilanjutkan tanpa mengulang dari awal. Jika kuota harian habis,
+    sisa batch memakai fallback rule-based tanpa mengirim request tambahan."""
     df, _ = preprocess_dataset(df)
     lama = pd.read_csv(output) if lanjutkan and output.exists() else pd.DataFrame()
     sudah = set(lama["ID_Laporan"]) if not lama.empty else set()
@@ -1380,15 +1403,21 @@ def proses_batch(df: pd.DataFrame, cfg: LLMConfig, batch_size: int = 10, jeda: f
         target = target.head(limit)
     baru = []
     total = len(target)
+    kuota_harian_habis = False
     for mulai in range(0, total, batch_size):
         potong = target.iloc[mulai:mulai + batch_size]
         laporan = [{"id": r.ID_Laporan, "teks": r.Teks_Bersih} for r in potong.itertuples()]
-        try:
-            hasil, metode = analisis_laporan_batch(laporan, cfg)
-        except Exception as e:  # noqa: BLE001
-            print(f"  ! batch {mulai // batch_size + 1} gagal ({e}); memakai fallback rule-based")
+        if cfg.pakai_llm and kuota_harian_habis:
             hasil = [{**analisis_offline(x["teks"], x["id"]), "_fallback": True} for x in laporan]
             metode = "Rule-based (fallback)"
+        else:
+            try:
+                hasil, metode = analisis_laporan_batch(laporan, cfg)
+            except Exception as e:  # noqa: BLE001
+                kuota_harian_habis = cfg.pakai_llm and _kuota_harian_habis(e)
+                print(f"  ! batch {mulai // batch_size + 1} gagal ({e}); memakai fallback rule-based")
+                hasil = [{**analisis_offline(x["teks"], x["id"]), "_fallback": True} for x in laporan]
+                metode = "Rule-based (fallback)"
         for r, h in zip(potong.to_dict("records"), hasil):
             baru.append({**r, **_ke_baris(h, metode)})
         gabungan = pd.concat([lama, pd.DataFrame(baru)], ignore_index=True)
@@ -1398,7 +1427,7 @@ def proses_batch(df: pd.DataFrame, cfg: LLMConfig, batch_size: int = 10, jeda: f
             progress(selesai, total)
         else:
             print(f"  {selesai}/{total} laporan dianalisis ({metode})")
-        if cfg.pakai_llm and selesai < total:
+        if cfg.pakai_llm and not kuota_harian_habis and selesai < total:
             time.sleep(jeda)  # menjaga batas request per menit (free tier)
     return pd.concat([lama, pd.DataFrame(baru)], ignore_index=True)
 
@@ -1887,8 +1916,10 @@ def _lab_eksperimen(st, cfg):
     st.caption("Prompt v1 = perintah singkat tanpa aturan. Prompt v2 = aturan ketat + contoh (few-shot) + knowledge base.")
     teks = st.text_area("Teks uji", value=CONTOH_TEKS["Sarkasme"], height=80, key="ep_teks")
     c1, c2 = st.columns(2)
-    banding = c1.selectbox("Bandingkan dengan", [p for p in PROVIDERS if p != cfg.provider], key="ep_banding",
-                           help="Provider lain memakai API key dari file .env")
+    pilihan = [p for p in PROVIDERS if p != cfg.provider]
+    banding = c1.selectbox("Bandingkan dengan", pilihan, key="ep_banding",
+                           index=pilihan.index(OFFLINE) if OFFLINE in pilihan else 0,
+                           help="Provider lain memakai API key dari file .env / Secrets")
     ulang = c2.checkbox("Uji konsistensi (Prompt v2 dijalankan 3×)", key="ep_ulang")
     if st.button("Jalankan eksperimen", key="ep_jalan"):
         with st.spinner("Menjalankan..."):
@@ -1947,6 +1978,9 @@ def halaman_dashboard():
 
     df = pd.read_csv(HASIL_PATH)
     df["Tanggal"] = pd.to_datetime(df["Tanggal"])
+    if cfg.pakai_llm and df["Metode"].str.contains("Rule-based|rule-based").any():
+        st.warning("Sebagian hasil di dashboard dibuat dengan **mode offline**, bukan Gemini. Hapus hasil di tab "
+                   "⚙️ Kelola Data lalu analisis ulang agar semua hasil berasal dari Gemini.")
     wilayah = st.multiselect("📍 Wilayah", sorted(df["Kabupaten_Kota"].unique()), placeholder="Semua kabupaten/kota")
     if wilayah:
         df = df[df["Kabupaten_Kota"].isin(wilayah)]

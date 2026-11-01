@@ -1,0 +1,10 @@
+.venv/
+.env
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+
+# bahan pribadi/tugas (tidak perlu di repo publik)
+standar/
+*.docx
+Draft_Laporan_SI-BERSIH.md

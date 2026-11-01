@@ -29,6 +29,7 @@ Struktur file:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -64,14 +65,18 @@ KEPANJANGAN = "Sistem Intelijen Berbasis Evaluasi Respons Sampah"
 
 def _pengaturan(nama: str, default: str) -> str:
     """Baca pengaturan dari .env (lokal) atau menu Secrets Streamlit Community Cloud (versi web)."""
-    if os.getenv(nama):
-        return os.getenv(nama)
     try:
         import streamlit as st
-
-        return str(st.secrets.get(nama) or default)
-    except Exception:  # noqa: BLE001 - tidak ada secrets.toml saat dijalankan lokal / lewat CLI
-        return default
+    except ImportError:
+        st = None
+    if st is not None:
+        try:
+            rahasia = st.secrets.get(nama)
+        except FileNotFoundError:  # secrets.toml tidak disediakan saat dijalankan lokal
+            rahasia = None
+        if rahasia:
+            return str(rahasia)
+    return os.getenv(nama) or default
 
 
 # >>> PLACEHOLDER API KEY <<<
@@ -1702,7 +1707,9 @@ def _pengaturan_ai(st) -> LLMConfig:
         cfg = config_default(provider)
         if provider != OFFLINE:
             key_awal = "" if cfg.api_key.startswith("MASUKKAN") else cfg.api_key
-            cfg.api_key = st.text_input("API key", value=key_awal, type="password", key=f"key_{provider}")
+            sidik_key = hashlib.sha256(cfg.api_key.encode()).hexdigest()[:12]
+            cfg.api_key = st.text_input("API key", value=key_awal, type="password",
+                                        key=f"key_{provider}_{sidik_key}")
             cfg.model = st.text_input("Nama model", value=cfg.model, key=f"model_{provider}")
             cfg.temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1, key="temperature")
     if cfg.pakai_llm:

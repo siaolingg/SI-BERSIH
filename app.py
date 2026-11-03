@@ -10,12 +10,15 @@ Cara pakai (jalankan dari folder proyek):
     python app.py batch --provider offline  -> baseline rule-based (tanpa API key)
     python app.py evaluate                  -> akurasi prediksi vs label manual
     python app.py fishbone                  -> membuat gambar fishbone_sibersih.png
-    streamlit run app.py                    -> aplikasi web (3 halaman: Daur Ulang, Cek Laporan, Dashboard)
+    python app.py dlhd                      -> unduh data asli DLHD Prov. Sulut (Satu Data Sulut)
+    streamlit run app.py                    -> aplikasi web (4 halaman: Akar Masalah, Daur Ulang, Cek Laporan,
+                                               Dashboard)
 
 Struktur file:
     1.  Konfigurasi & placeholder API key
     2.  Knowledge base daur ulang (sumber RAG lokal)
-    3.  Dataset generator
+    3.  Dataset generator (teks laporan warga)
+    3b. Data asli DLHD Provinsi Sulawesi Utara
     4.  Preprocessing
     5.  Prompt engineering
     6.  Integrasi LLM (Gemini / GPT / DeepSeek / Grok)
@@ -59,6 +62,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATASET_PATH = BASE_DIR / "dataset_sampah.csv"
 HASIL_PATH = BASE_DIR / "hasil_analisis.csv"
 FISHBONE_PATH = BASE_DIR / "fishbone_sibersih.png"
+DLHD_PATH = BASE_DIR / "data_dlhd_sulut.csv"      # data asli DLHD Prov. Sulut (sudah dirapikan)
+DLHD_MENTAH_DIR = BASE_DIR / "data_dlhd"          # file CSV asli persis seperti diunduh dari portal
 
 NAMA_SISTEM = "SI-BERSIH"
 KEPANJANGAN = "Sistem Intelijen Berbasis Evaluasi Respons Sampah"
@@ -752,6 +757,159 @@ def generate_dataset(n: int = 600, seed: int = 42, path: Path = DATASET_PATH) ->
 
 
 # =============================================================================
+# 3b. DATA ASLI DLHD PROVINSI SULAWESI UTARA (scraping sederhana dari portal Satu Data Sulut)
+# =============================================================================
+# Sumber: https://data.sulutprov.go.id — organisasi "Dinas Lingkungan Hidup Daerah Provinsi Sulawesi Utara".
+# Isinya angka resmi per kabupaten/kota 2020–2024 (timbulan, penanganan, pengurangan sampah). Data ini dipakai
+# untuk Root Cause Analysis, peta, tren/anomali, dan dasar rekomendasi kebijakan.
+
+DLHD_PORTAL = "https://data.sulutprov.go.id"
+DLHD_API = DLHD_PORTAL + "/api/3/action/package_search?q=sampah&rows=200"
+DLHD_ORG = "Dinas Lingkungan Hidup Daerah Provinsi Sulawesi Utara"
+
+# indikator di portal -> kolom SI-BERSIH (urutan = prioritas; dataset pertama dipakai, berikutnya hanya mengisi
+# sel yang kosong). Dataset "data-capaian-pengurangan-dan-penanganan-sampah-ton" sengaja tidak dipakai karena
+# barisnya bergeser (contoh 2020: angka Kab. Minahasa tercatat pada Kota Manado).
+INDIKATOR_DLHD = {
+    "data-jumlah-timbulan-sampah-yang-terkelola": ["Dikelola_Ton"],
+    "tersedianya-data-dan-informasi-penanganan-sampah-di-wilayah-provinsi":
+        ["Timbulan_Ton", "Ditangani_Ton", "Dikurangi_Ton", "Dikelola_Ton"],
+    "timbulan-sampah-yang-ditangani": ["Timbulan_Ton", "Ditangani_Ton"],
+    "persentase-sampah-terkelola": ["Persen_Terkelola_DLHD"],
+    "persentase-sampah-provinsi-yang-terkelola": ["Persen_Terkelola_DLHD"],
+    "persentase-sampah-terdaurulang": ["Persen_Daur_Ulang_DLHD"],
+    "persentase-jumlah-sampah-yang-terkurangi-melalui-3r": ["Persen_Daur_Ulang_DLHD"],
+}
+KOLOM_DLHD = ["Timbulan_Ton", "Ditangani_Ton", "Dikurangi_Ton", "Dikelola_Ton", "Persen_Terkelola_DLHD",
+              "Persen_Daur_Ulang_DLHD"]
+
+
+def _http_get(url: str) -> bytes:
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (SI-BERSIH; tugas kuliah)"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read()
+
+
+def _angka_dlhd(teks: str) -> float:
+    """Portal memakai format angka campuran: '45,767.90', '4.357,37', '46108,26', '3,379,17', '2.920'.
+    Sel kosong, '-', dan sel rusak format jam Excel ('978:20:00') dianggap tidak tersedia (NaN)."""
+    s = str(teks).strip().replace(" ", "")
+    if s in ("", "-") or ":" in s:
+        return float("nan")
+    if "," in s and "." in s:
+        grup = re.split(r"[.,]", s)
+        if len(grup) == 3 and len(grup[1]) != 3:        # '978,20.00' -> pemisah desimal = koma pertama
+            s = grup[0] + "." + grup[1]
+        elif s.rfind(",") > s.rfind("."):                # '4.357,37'
+            s = s.replace(".", "").replace(",", ".")
+        else:                                            # '45,767.90'
+            s = s.replace(",", "")
+    elif s.count(",") > 1:                               # '3,379,17' -> 3379.17
+        bagian = s.split(",")
+        s = "".join(bagian[:-1]) + "." + bagian[-1]
+    elif "," in s:                                       # '46108,26'
+        s = s.replace(",", ".")
+    elif s.count(".") > 1 or re.fullmatch(r"\d{1,3}\.\d{3}", s):   # '2.920' -> 2920 (pemisah ribuan)
+        s = s.replace(".", "")
+    try:
+        return float(s)
+    except ValueError:
+        return float("nan")
+
+
+def _nama_wilayah_dlhd(nama: str) -> str | None:
+    n = " ".join(str(nama).split()).title()
+    n = n.replace("Kabupaten Siau Tagulandang Biaro", "Kabupaten Kepulauan Siau Tagulandang Biaro")
+    return n if n in KOORDINAT else None                  # baris 'Total' dan nama asing diabaikan
+
+
+def susun_data_dlhd(folder: Path = DLHD_MENTAH_DIR, path: Path = DLHD_PATH) -> pd.DataFrame:
+    """Gabungkan semua CSV mentah DLHD menjadi satu tabel rapi: satu baris = satu kab/kota per tahun."""
+    import csv
+
+    data: dict[tuple[int, str], dict] = {}
+    for indikator, kolom in INDIKATOR_DLHD.items():
+        for f in sorted(folder.glob(f"{indikator}-20??-id_*.csv")):
+            tahun = int(re.search(r"-(\d{4})-id_", f.name).group(1))
+            baris = list(csv.reader(f.read_text(encoding="utf-8-sig").splitlines()))
+            for r in baris[2:]:
+                wilayah = _nama_wilayah_dlhd(r[-1]) if r else None
+                if not wilayah:
+                    continue
+                rec = data.setdefault((tahun, wilayah), {"Tahun": tahun, "Kabupaten_Kota": wilayah})
+                for k, v in zip(kolom, r[:-1]):
+                    nilai = _angka_dlhd(v)
+                    if pd.isna(rec.get(k, float("nan"))) and not pd.isna(nilai):
+                        rec[k] = nilai
+    df = pd.DataFrame(data.values()).reindex(columns=["Tahun", "Kabupaten_Kota"] + KOLOM_DLHD)
+    df = df.sort_values(["Tahun", "Kabupaten_Kota"]).reset_index(drop=True)
+    # Baris dianggap lengkap jika timbulan dan sampah terkelola sama-sama dilaporkan (> 0).
+    df["Data_Lengkap"] = (df["Timbulan_Ton"] > 0) & (df["Dikelola_Ton"] > 0)
+    df["Persen_Dikelola"] = (df["Dikelola_Ton"] / df["Timbulan_Ton"] * 100).where(df["Data_Lengkap"]).round(1)
+    df["Persen_Dikurangi"] = (df["Dikurangi_Ton"] / df["Timbulan_Ton"] * 100).where(df["Data_Lengkap"]).round(1)
+    # Menurut definisi DLHD, sampah dikelola = ditangani + dikurangi. Angka resmi tidak diubah; selisih > 10%
+    # hanya ditandai agar terlihat saat analisis.
+    hitung = df["Ditangani_Ton"] + df["Dikurangi_Ton"]
+    selisih = (df["Dikelola_Ton"] - hitung).abs() / hitung.where(hitung > 0)
+    df["Catatan_Data"] = ""
+    df.loc[~df["Data_Lengkap"], "Catatan_Data"] = "Data tidak dilaporkan / nol"
+    df.loc[df["Data_Lengkap"] & (selisih > 0.10), "Catatan_Data"] = (
+        "Tidak konsisten: dikelola ≠ ditangani + dikurangi")
+    df["Sumber"] = f"{DLHD_ORG} — {DLHD_PORTAL}"
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    return df
+
+
+def unduh_data_dlhd(folder: Path = DLHD_MENTAH_DIR) -> pd.DataFrame:
+    """Scraping sederhana: cari semua dataset sampah milik DLHD lewat API CKAN portal, unduh CSV aslinya."""
+    meta = json.loads(_http_get(DLHD_API))
+    paket = [p for p in meta["result"]["results"] if (p.get("organization") or {}).get("title") == DLHD_ORG]
+    folder.mkdir(exist_ok=True)
+    for p in paket:
+        for r in p.get("resources", []):
+            if str(r.get("format", "")).upper() == "CSV":
+                (folder / f"{p['name']}.csv").write_bytes(_http_get(r["url"]))
+    return susun_data_dlhd(folder)
+
+
+def muat_data_dlhd() -> pd.DataFrame | None:
+    if DLHD_PATH.exists():
+        d = pd.read_csv(DLHD_PATH)
+        d["Catatan_Data"] = d["Catatan_Data"].fillna("")
+        return d
+    if DLHD_MENTAH_DIR.exists() and any(DLHD_MENTAH_DIR.glob("*.csv")):
+        return susun_data_dlhd()
+    return None
+
+
+def ringkas_dlhd(d: pd.DataFrame) -> dict:
+    """Angka utama untuk RCA dan rekomendasi kebijakan (hanya baris yang datanya lengkap)."""
+    per_tahun = []
+    for tahun, g in d.groupby("Tahun"):
+        ok = g[g["Data_Lengkap"]]
+        per_tahun.append({
+            "tahun": int(tahun), "kabkota_melapor_lengkap": int(len(ok)), "kabkota_total": int(len(g)),
+            "timbulan_ton": round(float(ok["Timbulan_Ton"].sum()), 1),
+            "dikelola_ton": round(float(ok["Dikelola_Ton"].sum()), 1),
+            "persen_dikelola": round(float(ok["Dikelola_Ton"].sum() / ok["Timbulan_Ton"].sum() * 100), 1) if len(ok) else None,
+            "persen_dikurangi_3r": round(float(ok["Dikurangi_Ton"].sum() / ok["Timbulan_Ton"].sum() * 100), 1) if len(ok) else None,
+        })
+    acuan = max(per_tahun, key=lambda x: (x["kabkota_melapor_lengkap"], x["tahun"]))
+    g = d[(d["Tahun"] == acuan["tahun"]) & d["Data_Lengkap"]].sort_values("Persen_Dikelola")
+    return {
+        "sumber": f"{DLHD_ORG} ({DLHD_PORTAL})",
+        "per_tahun": per_tahun,
+        "tahun_acuan": acuan["tahun"],
+        "terendah_dikelola": [{"wilayah": r.Kabupaten_Kota, "persen_dikelola": r.Persen_Dikelola,
+                               "persen_dikurangi_3r": r.Persen_Dikurangi, "timbulan_ton": round(r.Timbulan_Ton, 1)}
+                              for r in g.head(5).itertuples()],
+        "kabkota_tanpa_data_lengkap": {int(t): sorted(x["Kabupaten_Kota"]) for t, x in d[~d["Data_Lengkap"]].groupby("Tahun")},
+    }
+
+
+# =============================================================================
 # 4. PREPROCESSING
 # =============================================================================
 
@@ -921,12 +1079,14 @@ Format JSON:
 {"nama_produk": "...", "alat": ["..."], "bahan": ["..."], "langkah": ["..."], "estimasi_waktu": "...",
  "tips_keamanan": ["..."], "potensi_nilai_ekonomi": "...", "confidence": 0, "confidence_reasoning": "..."}"""
 
-PROMPT_KEBIJAKAN = """Berikut ringkasan statistik hasil analisis laporan warga tentang sampah di Sulawesi Utara:
+PROMPT_KEBIJAKAN = """Berikut ringkasan statistik hasil analisis laporan warga tentang sampah di Sulawesi Utara,
+beserta data resmi DLHD Provinsi Sulawesi Utara (kunci "data_resmi_dlhd": timbulan, % sampah dikelola, dan
+% dikurangi lewat 3R per tahun serta kab/kota dengan pengelolaan terendah):
 <<STATISTIK>>
 
 Sebagai analis kebijakan Dinas Lingkungan Hidup, susun 5 rekomendasi prioritas berbasis data untuk
 pemerintah kab/kota, bank sampah, PKK, sekolah, dan komunitas gereja/masjid. Setiap rekomendasi harus
-merujuk angka pada statistik. Jangan merekomendasikan kompos.
+merujuk angka pada statistik (utamakan data resmi DLHD bila ada). Jangan merekomendasikan kompos.
 
 Format JSON:
 {"ringkasan": "2-3 kalimat temuan utama",
@@ -1342,8 +1502,11 @@ TINDAKAN_MASALAH = {
 
 
 def rekomendasi_kebijakan(df: pd.DataFrame, cfg: LLMConfig) -> dict:
-    """Rekomendasi decision making untuk lembaga (DLH) berdasarkan statistik hasil analisis."""
+    """Rekomendasi decision making untuk lembaga (DLH) berdasarkan data resmi DLHD + hasil analisis laporan."""
     stat = ringkas_statistik(df)
+    dlhd = muat_data_dlhd()
+    if dlhd is not None:
+        stat["data_resmi_dlhd"] = ringkas_dlhd(dlhd)
     if cfg.pakai_llm:
         try:
             hasil = panggil_llm(cfg, SYSTEM_PROMPT, isi_prompt(PROMPT_KEBIJAKAN,
@@ -1355,7 +1518,17 @@ def rekomendasi_kebijakan(df: pd.DataFrame, cfg: LLMConfig) -> dict:
     else:
         galat = None
     rekom = []
-    for i, x in enumerate(stat["laporan_negatif_per_wilayah_dan_masalah"][:5], start=1):
+    if "data_resmi_dlhd" in stat:
+        r = stat["data_resmi_dlhd"]
+        for x in r["terendah_dikelola"][:2]:
+            rekom.append({"prioritas": len(rekom) + 1, "wilayah": x["wilayah"], "masalah": "Cakupan pengelolaan rendah",
+                          "tindakan": "Perluas layanan angkut dan bangun TPS3R/bank sampah di tingkat desa/kelurahan.",
+                          "pihak_terlibat": "DLH kab/kota, DLHD Provinsi, pemerintah desa",
+                          "indikator_keberhasilan": "% sampah dikelola naik ≥ 15 poin dalam 1 tahun.",
+                          "dasar_data": f"DLHD {r['tahun_acuan']}: hanya {x['persen_dikelola']}% sampah dikelola "
+                                        f"dari {x['timbulan_ton']:,.0f} ton."})
+    for x in stat["laporan_negatif_per_wilayah_dan_masalah"][:5 - len(rekom)]:
+        i = len(rekom) + 1
         tindakan, pihak = TINDAKAN_MASALAH[x["masalah"]]
         rekom.append({"prioritas": i, "wilayah": x["wilayah"], "masalah": x["masalah"], "tindakan": tindakan,
                       "pihak_terlibat": pihak,
@@ -1474,8 +1647,9 @@ FISHBONE = {
                          "Belum ada mesin pencacah di tingkat kelurahan"],
     "MATERIAL (Bahan)": ["Dominasi plastik sekali pakai & sachet", "Organik (makanan, ikan, kelapa) tidak dipisah",
                          "Sampah kiriman dari laut & sungai"],
-    "METHOD (Metode)": ["Pola kumpul–angkut–buang ke TPA", "Jadwal angkut tidak konsisten",
-                        "Bank sampah/TPS3R belum terintegrasi"],
+    "METHOD (Metode)": ["Pola kumpul–angkut–buang; pengurangan 3R hanya 7,8% (DLHD 2023)",
+                        "Jadwal angkut tidak konsisten",
+                        "Pencatatan data kab/kota belum lengkap & tidak konsisten (DLHD)"],
     "ENVIRONMENT (Lingkungan)": ["Wilayah kepulauan & topografi berbukit", "Curah hujan tinggi memicu banjir sampah",
                                  "Lonjakan sampah saat hari raya & pesta adat"],
 }
@@ -1689,7 +1863,8 @@ def main_ui():
     st.set_page_config(page_title="SI-BERSIH", page_icon="♻️", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     halaman = st.navigation([
-        st.Page(halaman_daur_ulang, title="Daur Ulang Sampah", icon="♻️", url_path="daur-ulang", default=True),
+        st.Page(halaman_akar_masalah, title="Akar Masalah (RCA)", icon="🔎", url_path="akar-masalah", default=True),
+        st.Page(halaman_daur_ulang, title="Daur Ulang Sampah", icon="♻️", url_path="daur-ulang"),
         st.Page(halaman_cek_laporan, title="Cek Laporan Warga", icon="📝", url_path="cek-laporan"),
         st.Page(halaman_dashboard, title="Dashboard", icon="📊", url_path="dashboard"),
     ])
@@ -1717,6 +1892,169 @@ def _pengaturan_ai(st) -> LLMConfig:
     else:
         status.info("🟡 Mode offline. Isi API key di **Pengaturan AI** agar memakai Gemini.")
     return cfg
+
+
+# ---------------------------- Halaman 0: Akar Masalah (RCA) ----------------------------
+
+def _ton(x) -> str:
+    return f"{x:,.0f}".replace(",", ".") + " ton"
+
+
+def anomali_dlhd(d: pd.DataFrame, ambang: float = 20.0) -> pd.DataFrame:
+    """Anomaly detection pada data DLHD: perubahan % sampah dikelola ≥ ambang (poin) dibanding tahun sebelumnya."""
+    ok = d[d["Data_Lengkap"]].sort_values(["Kabupaten_Kota", "Tahun"]).copy()
+    ok["Perubahan"] = ok.groupby("Kabupaten_Kota")["Persen_Dikelola"].diff()
+    ok["Tahun_Sebelumnya"] = ok.groupby("Kabupaten_Kota")["Tahun"].shift()
+    hasil = ok[(ok["Perubahan"].abs() >= ambang) & (ok["Tahun"] - ok["Tahun_Sebelumnya"] == 1)]
+    return hasil[["Tahun", "Kabupaten_Kota", "Persen_Dikelola", "Perubahan", "Catatan_Data"]]
+
+
+def _peta_dlhd(st, px, d: pd.DataFrame, tahun: int):
+    g = d[(d["Tahun"] == tahun) & d["Data_Lengkap"]].copy()
+    g["lat"] = g["Kabupaten_Kota"].map(lambda k: KOORDINAT[k][0])
+    g["lon"] = g["Kabupaten_Kota"].map(lambda k: KOORDINAT[k][1])
+    peta = px.scatter_map(g, lat="lat", lon="lon", size="Timbulan_Ton", color="Persen_Dikelola",
+                          hover_name="Kabupaten_Kota", range_color=[0, 100], color_continuous_scale="RdYlGn",
+                          hover_data={"Timbulan_Ton": ":,.0f", "Persen_Dikelola": True, "Persen_Dikurangi": True,
+                                      "lat": False, "lon": False},
+                          size_max=40, zoom=6.2, center={"lat": 2.0, "lon": 124.9}, map_style="open-street-map",
+                          labels={"Persen_Dikelola": "% dikelola", "Timbulan_Ton": "Timbulan (ton)",
+                                  "Persen_Dikurangi": "% dikurangi (3R)"},
+                          title=f"Sampah terkelola per kab/kota {tahun} (lingkaran besar = timbulan besar, merah = rendah)")
+    st.plotly_chart(_gaya(peta, 540), width="stretch")
+    kosong = d[(d["Tahun"] == tahun) & ~d["Data_Lengkap"]]["Kabupaten_Kota"].tolist()
+    if kosong:
+        st.caption(f"Tidak tampil karena data {tahun} tidak dilaporkan/nol: " + ", ".join(kosong))
+
+
+def halaman_akar_masalah():
+    import plotly.express as px
+    import streamlit as st
+
+    _hero(st, "🔎 Akar Masalah (Root Cause Analysis)",
+          "Mengapa sampah di Sulawesi Utara belum tertangani? Dianalisis dari data resmi DLHD Provinsi Sulawesi Utara.")
+    d = muat_data_dlhd()
+    if d is None:
+        st.info("Data DLHD belum ada di folder proyek. Klik tombol di bawah untuk mengunduhnya dari portal "
+                f"Satu Data Sulut ({DLHD_PORTAL}).")
+        if st.button("⬇️ Unduh data DLHD", type="primary"):
+            with st.spinner("Mengunduh data DLHD..."):
+                unduh_data_dlhd()
+            st.rerun()
+        return
+    r = ringkas_dlhd(d)
+    th = r["tahun_acuan"]
+    a = next(x for x in r["per_tahun"] if x["tahun"] == th)
+    awal = r["per_tahun"][0]
+    rendah = r["terendah_dikelola"]
+    tak_lengkap = (d["Catatan_Data"] == "Data tidak dilaporkan / nol").sum()
+    tak_konsisten = d["Catatan_Data"].str.startswith("Tidak konsisten").sum()
+    st.caption(f"Sumber: {r['sumber']} · data 2020–2024 · tahun acuan {th} (semua 15 kab/kota melapor lengkap)")
+
+    with st.container(key="kartu_rca_1"):
+        st.markdown("#### 1️⃣ Definisi masalah")
+        _kartu_statistik(st, [
+            (f"Timbulan sampah {th}", _ton(a["timbulan_ton"]), "#6A1B9A"),
+            ("Sampah terkelola", f"{a['persen_dikelola']}%", "#2E7D32"),
+            ("Tidak terkelola", _ton(a["timbulan_ton"] - a["dikelola_ton"]), "#C62828"),
+            ("Dikurangi lewat 3R", f"{a['persen_dikurangi_3r']}%", "#EF6C00")])
+        st.write(f"Pada {th}, Sulawesi Utara menghasilkan **{_ton(a['timbulan_ton'])}** sampah, tetapi hanya "
+                 f"**{a['persen_dikelola']}%** yang terkelola. Sekitar **{_ton(a['timbulan_ton'] - a['dikelola_ton'])}** "
+                 "sampah tidak tertangani dan berpotensi dibuang ke sungai, pantai, atau dibakar. Hanya "
+                 f"**{a['persen_dikurangi_3r']}%** yang dikurangi dari sumber melalui 3R (bank sampah, daur ulang).")
+
+    with st.container(key="kartu_rca_2"):
+        st.markdown("#### 2️⃣ Mengumpulkan data")
+        st.write(f"- **Data resmi DLHD** ({len(d)} baris = 15 kab/kota × {d['Tahun'].nunique()} tahun) diunduh otomatis "
+                 f"dari [{DLHD_PORTAL}]({DLHD_PORTAL}) — `python app.py dlhd`.\n"
+                 f"- **Kualitas data**: {tak_lengkap} baris tidak dilaporkan/nol dan {tak_konsisten} baris tidak "
+                 "konsisten (angka resmi tidak diubah, hanya ditandai).\n"
+                 "- **Teks laporan warga** dianalisis LLM di halaman Cek Laporan & Dashboard untuk melihat sentimen "
+                 "dan jenis masalah yang dirasakan warga.")
+        with st.expander("Lihat tabel data DLHD"):
+            st.dataframe(d.drop(columns=["Sumber"]), hide_index=True, width="stretch")
+
+    with st.container(key="kartu_rca_3"):
+        st.markdown("#### 3️⃣ Menemukan akar masalah")
+        tren = pd.DataFrame(r["per_tahun"]).melt("tahun", ["persen_dikelola", "persen_dikurangi_3r"],
+                                                 var_name="Indikator", value_name="Persen")
+        tren["Indikator"] = tren["Indikator"].map({"persen_dikelola": "% sampah dikelola",
+                                                   "persen_dikurangi_3r": "% dikurangi dari sumber (3R)"})
+        fig = px.line(tren, x="tahun", y="Persen", color="Indikator", markers=True, text="Persen",
+                      title="Sampah dikelola vs dikurangi dari sumber — Provinsi Sulawesi Utara",
+                      labels={"tahun": "", "Persen": "%"}, color_discrete_sequence=["#2E7D32", "#EF6C00"])
+        fig.update_traces(textposition="top center")
+        fig.update_xaxes(dtick=1)
+        fig.update_yaxes(range=[0, 100])
+        st.plotly_chart(_gaya(fig), width="stretch")
+        st.caption("Tahun 2024: hanya kab/kota yang melapor lengkap yang dihitung; penurunan tajam perlu dicek ke DLHD.")
+        g = d[(d["Tahun"] == th) & d["Data_Lengkap"]].sort_values("Persen_Dikelola")
+        bar = px.bar(g, x="Persen_Dikelola", y="Kabupaten_Kota", orientation="h", text="Persen_Dikelola",
+                     color="Persen_Dikelola", color_continuous_scale="RdYlGn", range_color=[0, 100],
+                     title=f"% sampah dikelola per kab/kota ({th})", labels={"Persen_Dikelola": "", "Kabupaten_Kota": ""})
+        bar.update_coloraxes(showscale=False)
+        bar.update_traces(textangle=0, textposition="outside", cliponaxis=False)
+        bar.update_xaxes(range=[0, 105])
+        st.plotly_chart(_gaya(bar, 480), width="stretch")
+
+        st.markdown("**Analisis 5 Whys** (setiap jawaban disertai bukti)")
+        whys = pd.DataFrame([
+            ("Mengapa sampah menumpuk dan dikeluhkan warga?",
+             "Sebagian besar sampah tidak terkelola.",
+             f"DLHD {th}: hanya {a['persen_dikelola']}% dari {_ton(a['timbulan_ton'])} yang terkelola."),
+            ("Mengapa banyak sampah tidak terkelola?",
+             "Penanganan bergantung pada pengangkutan, dan cakupannya timpang antarwilayah.",
+             "Terendah: " + ", ".join(f"{x['wilayah'].replace('Kabupaten ', 'Kab. ')} {x['persen_dikelola']}%"
+                                      for x in rendah[:3]) + "."),
+            ("Mengapa hanya bergantung pada pengangkutan?",
+             "Pengurangan dari sumber (pilah, bank sampah, daur ulang) sangat kecil dan terus turun.",
+             f"% dikurangi 3R: {awal['persen_dikurangi_3r']}% ({awal['tahun']}) → {a['persen_dikurangi_3r']}% ({th})."),
+            ("Mengapa pengurangan dari sumber kecil?",
+             "Warga belum tahu sampahnya bisa diolah menjadi apa, dan fasilitas pilah/bank sampah terbatas.",
+             "Hipotesis — diperiksa lewat laporan warga yang dianalisis LLM (kategori Partisipasi & Edukasi "
+             "serta Fasilitas & TPS di Dashboard)."),
+            ("Mengapa kondisi ini tidak cepat terdeteksi?",
+             "Pencatatan dan pemantauan data persampahan belum rapi.",
+             f"{tak_lengkap} baris data DLHD tidak dilaporkan/nol dan {tak_konsisten} baris tidak konsisten."),
+        ], columns=["Pertanyaan", "Jawaban", "Bukti"])
+        st.markdown("| Why | Pertanyaan | Jawaban | Bukti |\n|---|---|---|---|\n" + "\n".join(
+            f"| {i} | {r.Pertanyaan} | {r.Jawaban} | {r.Bukti} |" for i, r in enumerate(whys.itertuples(), start=1)))
+        st.write("")
+        st.error("**Akar masalah:** pengelolaan sampah di Sulawesi Utara masih bertumpu pada pola kumpul–angkut–buang, "
+                 "bukan pengurangan dan pengolahan di sumber; warga kurang mendapat panduan praktis mengolah sampah, "
+                 "dan pemantauan data belum kuat.")
+        st.markdown("**Fishbone diagram** (pengelompokan penyebab: Man, Machine, Material, Method, Environment)")
+        if not FISHBONE_PATH.exists():
+            buat_fishbone()
+        st.image(str(FISHBONE_PATH), width="stretch")
+
+    with st.container(key="kartu_rca_4"):
+        st.markdown("#### 4️⃣ Solusi korektif & preventif")
+        c1, c2 = st.columns(2)
+        c1.markdown("**Korektif (memperbaiki yang sudah terjadi)**\n"
+                    f"- Tambah armada & ritase di wilayah terendah ({', '.join(x['wilayah'] for x in rendah[:3])}).\n"
+                    "- Bersihkan titik buang liar yang paling banyak dilaporkan warga.\n"
+                    "- Lengkapi dan koreksi data kab/kota yang kosong/tidak konsisten.")
+        c2.markdown("**Preventif (mencegah terulang)**\n"
+                    "- Pemilahan dari rumah + bank sampah/TPS3R per kelurahan.\n"
+                    "- Panduan daur ulang praktis untuk warga (maggot BSF, eco-enzyme, ecobrick) → halaman **Daur Ulang**.\n"
+                    "- Analisis keluhan warga otomatis dengan LLM → halaman **Cek Laporan**.")
+
+    with st.container(key="kartu_rca_5"):
+        st.markdown("#### 5️⃣ Strategi yang bisa dijalankan")
+        st.write("Prioritas tindakan per wilayah disusun oleh AI dari data DLHD + hasil analisis laporan warga di "
+                 "**Dashboard → 🏛️ Saran untuk Pemerintah**.")
+
+    with st.container(key="kartu_rca_6"):
+        st.markdown("#### 6️⃣ Memantau solusi")
+        an = anomali_dlhd(d)
+        if len(an):
+            st.warning(f"🚨 **{len(an)} perubahan drastis** (≥ 20 poin) pada % sampah dikelola dibanding tahun sebelumnya. "
+                       "Perlu dicek: perubahan nyata atau masalah pencatatan.")
+            st.dataframe(an.rename(columns={"Persen_Dikelola": "% dikelola", "Perubahan": "Perubahan (poin)",
+                                            "Catatan_Data": "Catatan"}), hide_index=True, width="stretch")
+        st.caption("Indikator keberhasilan: % sampah dikelola dan % dikurangi lewat 3R naik setiap tahun, laporan warga "
+                   "bernada negatif turun. Peta & tren lengkap ada di Dashboard.")
 
 
 # ---------------------------- Halaman 1: Daur Ulang ----------------------------
@@ -1994,7 +2332,7 @@ def halaman_dashboard():
     if df.empty:
         st.warning("Tidak ada data untuk wilayah ini.")
         return
-    tab = st.tabs(["📈 Ringkasan", "🗺️ Peta & Tren", "🎯 Akurasi AI", "🏛️ Saran untuk Pemerintah", "⚙️ Kelola Data"])
+    tab = st.tabs(["📈 Ringkasan", "🗺️ Peta & Tren (DLHD)", "🎯 Akurasi AI", "🏛️ Saran untuk Pemerintah", "⚙️ Kelola Data"])
 
     with tab[0]:
         _kartu_statistik(st, [
@@ -2019,32 +2357,29 @@ def halaman_dashboard():
                                      color_discrete_sequence=["#66BB6A"]), 360), width="stretch")
 
     with tab[1]:
-        agg = (df.groupby("Kabupaten_Kota")
-               .agg(Jumlah=("ID_Laporan", "count"),
-                    Negatif=("Pred_Sentimen", lambda s: round((s == "Negatif").mean() * 100)),
-                    Masalah=("Pred_Masalah", lambda s: s.mode().iat[0]))
-               .reset_index())
-        agg["lat"] = agg["Kabupaten_Kota"].map(lambda k: KOORDINAT[k][0])
-        agg["lon"] = agg["Kabupaten_Kota"].map(lambda k: KOORDINAT[k][1])
-        peta = px.scatter_map(agg, lat="lat", lon="lon", size="Jumlah", color="Negatif", hover_name="Kabupaten_Kota",
-                              hover_data={"Masalah": True, "Jumlah": True, "lat": False, "lon": False},
-                              color_continuous_scale="RdYlGn_r", size_max=40, zoom=6.2,
-                              center={"lat": 2.0, "lon": 124.9}, map_style="open-street-map",
-                              labels={"Negatif": "% negatif"},
-                              title="Sebaran laporan (lingkaran besar = banyak laporan, merah = banyak keluhan)")
-        st.plotly_chart(_gaya(peta, 560), width="stretch")
-        bulanan = df.groupby([df["Tanggal"].dt.to_period("M").dt.to_timestamp(), "Pred_Jenis"]).size().reset_index(name="Jumlah")
-        st.plotly_chart(_gaya(px.line(bulanan, x="Tanggal", y="Jumlah", color="Pred_Jenis", markers=True,
-                                      color_discrete_map=WARNA_JENIS, title="Jumlah laporan per bulan",
-                                      labels={"Tanggal": "", "Jumlah": ""})), width="stretch")
-        total = df.groupby(df["Tanggal"].dt.to_period("M")).size()
-        z = (total - total.mean()) / (total.std() or 1)
-        anomali = z[z > 1.5]
-        if len(anomali):
-            st.warning("🚨 **Lonjakan laporan terdeteksi:** " + ", ".join(
-                f"{p.strftime('%B %Y')} ({total[p]} laporan)" for p in anomali.index))
+        d = muat_data_dlhd()
+        if d is None:
+            st.info("Data DLHD belum diunduh. Buka halaman 🔎 Akar Masalah untuk mengunduhnya.")
         else:
-            st.success("Tidak ada lonjakan laporan yang tidak wajar.")
+            if wilayah:
+                d = d[d["Kabupaten_Kota"].isin(wilayah)]
+            st.caption(f"Data resmi {DLHD_ORG} — {DLHD_PORTAL}")
+            tahun = st.select_slider("Tahun", sorted(d["Tahun"].unique()), value=ringkas_dlhd(muat_data_dlhd())["tahun_acuan"])
+            _peta_dlhd(st, px, d, int(tahun))
+            tabel = d.pivot_table(index="Kabupaten_Kota", columns="Tahun", values="Persen_Dikelola")
+            tabel = tabel.loc[tabel.mean(axis=1).sort_values().index]
+            heat = px.imshow(tabel, text_auto=".0f", aspect="auto", color_continuous_scale="RdYlGn",
+                             range_color=[0, 100], labels={"x": "", "y": "", "color": "% dikelola"},
+                             title="Tren % sampah dikelola per kab/kota (sel kosong = tidak dilaporkan)")
+            heat.update_xaxes(dtick=1, side="top")
+            st.plotly_chart(_gaya(heat, 520), width="stretch")
+            an = anomali_dlhd(d)
+            if len(an):
+                st.warning("🚨 **Anomali terdeteksi** — perubahan % sampah dikelola ≥ 20 poin dalam setahun:")
+                st.dataframe(an.rename(columns={"Persen_Dikelola": "% dikelola", "Perubahan": "Perubahan (poin)",
+                                                "Catatan_Data": "Catatan"}), hide_index=True, width="stretch")
+            else:
+                st.success("Tidak ada perubahan yang tidak wajar.")
 
     with tab[2]:
         st.caption("Membandingkan jawaban AI dengan label yang benar di dataset.")
@@ -2143,8 +2478,11 @@ def main_cli():
     b.add_argument("--batch-size", type=int, default=10)
     b.add_argument("--jeda", type=float, default=7.0)
     b.add_argument("--ulang", action="store_true", help="hapus hasil lama dan mulai dari awal")
+    b.add_argument("--ulang-fallback", action="store_true",
+                   help="analisis ulang hanya baris yang dulu gagal (Metode = Rule-based (fallback))")
     sub.add_parser("evaluate", help="hitung akurasi hasil_analisis.csv")
     sub.add_parser("fishbone", help="buat fishbone_sibersih.png")
+    sub.add_parser("dlhd", help="unduh data asli DLHD Prov. Sulut -> data_dlhd/ dan data_dlhd_sulut.csv")
     args = parser.parse_args()
 
     if args.perintah == "generate":
@@ -2159,6 +2497,11 @@ def main_cli():
             sys.exit(f"API key {cfg.provider} belum diisi (lihat .env.example). Pakai --provider offline untuk baseline.")
         if args.ulang and HASIL_PATH.exists():
             HASIL_PATH.unlink()
+        elif args.ulang_fallback and HASIL_PATH.exists():
+            lama = pd.read_csv(HASIL_PATH)
+            gagal = lama["Metode"].astype(str).str.contains("fallback")
+            lama[~gagal].to_csv(HASIL_PATH, index=False, encoding="utf-8-sig")
+            print(f"{gagal.sum()} baris fallback dihapus dan akan dianalisis ulang.")
         print(f"Menganalisis dengan {cfg.label} ...")
         hasil = proses_batch(pd.read_csv(DATASET_PATH), cfg, args.batch_size, args.jeda, args.limit)
         print(f"✔ {len(hasil)} baris tersimpan di {HASIL_PATH.name}")
@@ -2170,6 +2513,12 @@ def main_cli():
         print("\nAkurasi (%) per kategori teks:\n" + ev["per_kategori"].to_string())
     elif args.perintah == "fishbone":
         print(f"✔ {buat_fishbone()}")
+    elif args.perintah == "dlhd":
+        d = unduh_data_dlhd()
+        print(f"✔ {len(d)} baris data DLHD ({d['Tahun'].min()}–{d['Tahun'].max()}) disimpan ke {DLHD_PATH.name}")
+        for x in ringkas_dlhd(d)["per_tahun"]:
+            print(f"  {x['tahun']}: timbulan {x['timbulan_ton']:,.0f} ton, dikelola {x['persen_dikelola']}%, "
+                  f"dikurangi 3R {x['persen_dikurangi_3r']}% ({x['kabkota_melapor_lengkap']}/15 kab/kota lengkap)")
     else:
         parser.print_help()
         print("\nDashboard: streamlit run app.py")

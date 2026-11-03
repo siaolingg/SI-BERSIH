@@ -42,6 +42,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pandas as pd
@@ -910,6 +911,90 @@ def ringkas_dlhd(d: pd.DataFrame) -> dict:
 
 
 # =============================================================================
+# 3c. INPUT LINK: EKSTRAKSI TEKS OTOMATIS DARI WEBSITE (berita, blog, halaman pengaduan)
+# =============================================================================
+# Sesuai tugas: "input ke sistem dapat berupa link ... sistem meng-extract text dari website secara otomatis dan
+# dapat memberikan rekomendasi". Halaman diunduh, paragrafnya diambil, lalu dianalisis LLM secara batch.
+
+POLA_TOPIK_SAMPAH = re.compile(r"sampah|plastik|limbah|\btpa\b|\btps|kebersihan|daur ulang|organik|kresek|"
+                               r"styrofoam|selokan|\bgot\b|bank sampah|tumpuk|buang|bau|pengangkutan", re.I)
+
+
+class _PengambilParagraf(HTMLParser):
+    """Parser HTML sederhana: mengambil teks per paragraf, mengabaikan menu, skrip, dan footer."""
+    BLOK = {"p", "li", "h1", "h2", "h3", "h4", "blockquote", "td", "div", "article", "section", "br"}
+    ABAIKAN = {"script", "style", "noscript", "nav", "footer", "header", "aside", "form", "button", "svg", "select"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.paragraf, self.judul, self._buf, self._abaikan, self._di_judul = [], "", [], 0, False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.ABAIKAN:
+            self._abaikan += 1
+        elif tag == "title":
+            self._di_judul = True
+        elif tag in self.BLOK:
+            self._tutup()
+
+    def handle_endtag(self, tag):
+        if tag in self.ABAIKAN:
+            self._abaikan = max(0, self._abaikan - 1)
+        elif tag == "title":
+            self._di_judul = False
+        elif tag in self.BLOK:
+            self._tutup()
+
+    def handle_data(self, data):
+        if self._di_judul:
+            self.judul += data
+        elif not self._abaikan:
+            self._buf.append(data)
+
+    def _tutup(self):
+        teks = " ".join("".join(self._buf).split())
+        self._buf = []
+        if teks:
+            self.paragraf.append(teks)
+
+
+def ambil_teks_dari_link(url: str, maks: int = 10) -> dict:
+    """Unduh halaman web, ambil paragraf bermakna (≥ 8 kata), utamakan yang membahas sampah."""
+    url = url.strip()
+    if not re.match(r"https?://", url):
+        url = "https://" + url
+    mentah = _http_get(url)
+    try:
+        html_teks = mentah.decode("utf-8")
+    except UnicodeDecodeError:
+        html_teks = mentah.decode("cp1252", errors="replace")
+    p = _PengambilParagraf()
+    p.feed(html_teks)
+    p._tutup()
+    paragraf = list(dict.fromkeys(x[:700] for x in p.paragraf if len(x.split()) >= 8))
+    relevan = [x for x in paragraf if POLA_TOPIK_SAMPAH.search(x)]
+    return {"url": url, "judul": " ".join(p.judul.split()), "total_paragraf": len(paragraf),
+            "paragraf_relevan": len(relevan), "teks": (relevan or paragraf)[:maks]}
+
+
+def analisis_link(url: str, cfg: LLMConfig, maks: int = 10) -> dict:
+    """Ekstraksi teks dari link + analisis batch (10 paragraf per permintaan LLM)."""
+    data = ambil_teks_dari_link(url, maks)
+    laporan = [{"id": f"P{i:02d}", "teks": bersihkan_teks(t)} for i, t in enumerate(data["teks"], start=1)]
+    hasil, metode, galat = [], cfg.label, None
+    for mulai in range(0, len(laporan), 10):
+        potong = laporan[mulai:mulai + 10]
+        try:
+            h, metode = analisis_laporan_batch(potong, cfg)
+        except Exception as e:  # noqa: BLE001
+            galat = str(e)
+            h, metode = [{**analisis_offline(x["teks"], x["id"]), "_fallback": True} for x in potong], "Rule-based (fallback)"
+        hasil += h
+    baris = [{"Teks": asli, **_ke_baris(h, metode)} for asli, h in zip(data["teks"], hasil)]
+    return {**data, "hasil": pd.DataFrame(baris), "metode": metode, "_error": galat}
+
+
+# =============================================================================
 # 4. PREPROCESSING
 # =============================================================================
 
@@ -1092,6 +1177,20 @@ Format JSON:
 {"ringkasan": "2-3 kalimat temuan utama",
  "rekomendasi": [{"prioritas": 1, "wilayah": "...", "masalah": "...", "tindakan": "...", "pihak_terlibat": "...",
    "indikator_keberhasilan": "...", "dasar_data": "..."}]}"""
+
+
+PROMPT_AGEN = """Kamu adalah AGEN TINDAK LANJUT SI-BERSIH di Dinas Lingkungan Hidup Sulawesi Utara.
+Laporan warga: <<TEKS>>
+Hasil analisis laporan: <<ANALISIS>>
+Hasil alat (tools) yang sudah dijalankan agen:
+<<OBSERVASI>>
+
+Putuskan tindak lanjut laporan ini berdasarkan analisis dan hasil alat. Prioritas Tinggi bila keluhan negatif
+tentang sampah menumpuk/tidak diangkut/membahayakan kesehatan, atau wilayahnya memiliki % sampah dikelola rendah.
+Jangan merekomendasikan kompos. Format JSON:
+{"prioritas": "Tinggi|Sedang|Rendah", "alasan_prioritas": "...", "instansi_tujuan": "...",
+ "tindakan": ["2-4 langkah konkret"], "batas_waktu": "...", "balasan_untuk_warga": "2-3 kalimat sopan",
+ "perlu_verifikasi_manusia": true, "confidence": 0, "confidence_reasoning": "..."}"""
 
 
 def isi_prompt(template: str, **nilai) -> str:
@@ -1581,6 +1680,87 @@ def rekomendasi_kebijakan(df: pd.DataFrame, cfg: LLMConfig) -> dict:
     if galat:
         hasil["_error"] = galat
     return hasil
+
+
+def _alat_cari_wilayah(teks: str) -> str | None:
+    """Alat agen 1: tebak kab/kota dari nama lokasi atau nama daerah yang disebut di laporan."""
+    t = teks.lower()
+    kandidat = [(lok, kab) for kab, daftar in LOKASI_SULUT.items() for lok in daftar]
+    kandidat += [(re.sub(r"^(Kota|Kabupaten) (Kepulauan )?", "", kab), kab) for kab in LOKASI_SULUT]
+    for nama, kab in sorted(kandidat, key=lambda x: -len(x[0])):
+        if nama.lower() in t:
+            return kab
+    return None
+
+
+def _alat_data_dlhd(wilayah: str | None) -> dict | None:
+    """Alat agen 2: angka resmi DLHD wilayah tersebut (tahun acuan; bila kosong, tahun lengkap terakhir)."""
+    d = muat_data_dlhd()
+    if d is None or not wilayah:
+        return None
+    g = d[(d["Kabupaten_Kota"] == wilayah) & d["Data_Lengkap"]].sort_values("Tahun")
+    if g.empty:
+        return None
+    acuan = g[g["Tahun"] == ringkas_dlhd(d)["tahun_acuan"]]   # tahun ketika semua kab/kota melapor lengkap
+    r = (acuan if len(acuan) else g).iloc[-1]
+    return {"tahun": int(r["Tahun"]), "persen_dikelola": float(r["Persen_Dikelola"]),
+            "persen_dikurangi_3r": float(r["Persen_Dikurangi"]), "timbulan_ton": round(float(r["Timbulan_Ton"]))}
+
+
+def _alat_riwayat_laporan(wilayah: str | None, masalah: str) -> int | None:
+    """Alat agen 3: jumlah laporan negatif serupa (wilayah + masalah sama) di hasil analisis dashboard."""
+    if not wilayah or not HASIL_PATH.exists():
+        return None
+    df = pd.read_csv(HASIL_PATH)
+    return int(((df["Kabupaten_Kota"] == wilayah) & (df["Pred_Masalah"] == masalah)
+                & (df["Pred_Sentimen"] == "Negatif")).sum())
+
+
+def agen_tindak_lanjut(teks: str, analisis: dict, cfg: LLMConfig) -> dict:
+    """AI Agent: observasi hasil analisis → jalankan alat (wilayah, data DLHD, riwayat laporan) → putuskan tindak
+    lanjut dengan LLM → guardrail. Setiap langkah dicatat agar keputusan agen dapat dijelaskan (XAI)."""
+    langkah = [("Observasi", f"Sentimen {analisis['sentimen']}, masalah {analisis['masalah_utama']}, "
+                             f"keyakinan {analisis['confidence']}%, ambiguitas {analisis['tingkat_ambiguitas']}.")]
+    wilayah = _alat_cari_wilayah(teks)
+    langkah.append(("Alat cari_wilayah", wilayah or "Wilayah tidak disebut di laporan."))
+    dlhd = _alat_data_dlhd(wilayah)
+    langkah.append(("Alat data_dlhd", f"DLHD {dlhd['tahun']}: {dlhd['persen_dikelola']}% sampah dikelola, "
+                                      f"{dlhd['persen_dikurangi_3r']}% dikurangi 3R." if dlhd else "Data DLHD tidak tersedia."))
+    riwayat = _alat_riwayat_laporan(wilayah, analisis["masalah_utama"])
+    langkah.append(("Alat riwayat_laporan", f"{riwayat} laporan negatif serupa di dashboard." if riwayat is not None
+                    else "Riwayat tidak tersedia."))
+    verifikasi = analisis["confidence"] < 70 or analisis["tingkat_ambiguitas"] == "Tinggi"
+    observasi = {"wilayah": wilayah, "data_dlhd": dlhd, "laporan_negatif_serupa": riwayat,
+                 "aturan_verifikasi_manusia": verifikasi}
+    rencana, galat = None, None
+    if cfg.pakai_llm:
+        try:
+            ringkas = {k: analisis.get(k) for k in ("jenis_sampah", "sentimen", "masalah_utama", "sarkasme",
+                                                     "tingkat_ambiguitas", "confidence", "rekomendasi_produk")}
+            rencana = panggil_llm(cfg, SYSTEM_PROMPT, isi_prompt(
+                PROMPT_AGEN, teks=teks, analisis=json.dumps(ringkas, ensure_ascii=False),
+                observasi=json.dumps(observasi, ensure_ascii=False)))
+            metode = cfg.label
+        except Exception as e:  # noqa: BLE001
+            galat = str(e)
+    if not isinstance(rencana, dict):
+        tindakan, pihak = TINDAKAN_MASALAH[analisis["masalah_utama"]]
+        tinggi = analisis["sentimen"] == "Negatif" and ((dlhd and dlhd["persen_dikelola"] < 50) or (riwayat or 0) >= 5)
+        rencana = {"prioritas": "Tinggi" if tinggi else "Sedang" if analisis["sentimen"] == "Negatif" else "Rendah",
+                   "alasan_prioritas": "Ditentukan dari sentimen, % sampah dikelola wilayah (DLHD), dan jumlah laporan serupa.",
+                   "instansi_tujuan": pihak, "tindakan": [tindakan, "Kabari pelapor setelah tindakan selesai."],
+                   "batas_waktu": "3 hari kerja" if tinggi else "7 hari kerja",
+                   "balasan_untuk_warga": "Terima kasih atas laporannya. Laporan Anda sudah kami teruskan ke petugas "
+                                          "terkait dan akan ditindaklanjuti.",
+                   "confidence": 60, "confidence_reasoning": "Rencana disusun aturan (rule-based) tanpa LLM."}
+        metode = "Rule-based" + (" (fallback)" if galat else "")
+    rencana["tindakan"] = [t for t in _sebagai_list(rencana.get("tindakan")) if not POLA_TERLARANG.search(str(t))]
+    rencana["prioritas"] = _pilih_opsi(rencana.get("prioritas"), ["Tinggi", "Sedang", "Rendah"], "Sedang")
+    rencana["perlu_verifikasi_manusia"] = bool(rencana.get("perlu_verifikasi_manusia")) or verifikasi
+    rencana["confidence"] = _confidence(rencana.get("confidence"))
+    langkah.append(("Keputusan", f"Prioritas {rencana['prioritas']} → {rencana.get('instansi_tujuan', '-')}"
+                                 + (" · perlu verifikasi petugas" if rencana["perlu_verifikasi_manusia"] else "")))
+    return {**rencana, "_langkah": langkah, "_metode": metode, "_error": galat}
 
 
 # =============================================================================
@@ -2254,7 +2434,74 @@ def halaman_cek_laporan():
 
     ss, cfg = st.session_state, st.session_state["cfg"]
     _hero(st, "📝 Cek Laporan Warga",
-          "Tempel keluhan warga tentang sampah. SI-BERSIH membaca jenis sampah, perasaan warga, dan masalahnya.")
+          "Tempel keluhan warga atau masukkan link berita/website. SI-BERSIH membaca jenis sampah, perasaan warga, "
+          "dan masalahnya.")
+    mode = st.segmented_control("Sumber teks", ["✍️ Tulis / tempel teks", "🔗 Ambil dari link website"],
+                                default="✍️ Tulis / tempel teks", key="cl_mode", label_visibility="collapsed")
+    if mode == "🔗 Ambil dari link website":
+        _cek_link(st, cfg)
+    else:
+        _cek_teks(st, cfg)
+    st.write("")
+    with st.expander("🧪 Lab eksperimen (untuk dosen): bandingkan prompt & model", expanded=bool(ss.get("ep"))):
+        _lab_eksperimen(st, cfg)
+
+
+def _cek_link(st, cfg):
+    import plotly.express as px
+
+    ss = st.session_state
+    with st.container(key="kartu_link"):
+        st.markdown("**Link berita / website** — teks diambil otomatis dari halaman, lalu setiap paragraf yang "
+                    "membahas sampah dianalisis AI.")
+        url = st.text_input("Link", key="cl_url", label_visibility="collapsed",
+                            placeholder="https://... (berita sampah, halaman pengaduan, blog, dll.)")
+        maks = st.slider("Jumlah paragraf yang dianalisis", 3, 20, 10, key="cl_maks",
+                         help="10 paragraf = 1 permintaan ke Gemini (hemat kuota).")
+        if st.button("🔗 Ambil teks & analisis", type="primary", disabled=not url.strip(), width="stretch"):
+            with st.spinner("Mengambil teks dari website dan menganalisisnya..."):
+                try:
+                    ss["cl_link"] = analisis_link(url, cfg, maks)
+                except Exception as e:  # noqa: BLE001
+                    ss["cl_link"] = {"gagal": f"Halaman tidak bisa diambil: {str(e)[:200]}"}
+    r = ss.get("cl_link")
+    if not r:
+        return
+    if r.get("gagal"):
+        st.error(r["gagal"] + " Pastikan link benar dan halaman tidak memerlukan login.")
+        return
+    _status_metode(st, r)
+    df = r["hasil"]
+    if df.empty:
+        st.warning("Tidak ada paragraf teks yang bisa dianalisis di halaman ini.")
+        return
+    st.caption(f"📰 **{r['judul'] or r['url']}** · {r['total_paragraf']} paragraf ditemukan, "
+               f"{r['paragraf_relevan']} membahas sampah, {len(df)} dianalisis · {r['metode']}")
+    _kartu_statistik(st, [
+        ("Teks dianalisis", f"{len(df)}", "#2E7D32"),
+        ("Bernada negatif", f"{(df['Pred_Sentimen'] == 'Negatif').mean():.0%}", WARNA_SENTIMEN["Negatif"]),
+        ("Masalah terbanyak", df["Pred_Masalah"].mode().iat[0], "#6A1B9A"),
+        ("Rata-rata keyakinan", f"{df['Confidence'].mean():.0f}%", "#1565C0")])
+    c1, c2 = st.columns(2)
+    for kolom, (kol, warna, judul) in zip((c1, c2), [("Pred_Sentimen", WARNA_SENTIMEN, "Sentimen"),
+                                                    ("Pred_Jenis", WARNA_JENIS, "Jenis sampah")]):
+        fig = px.pie(df, names=kol, hole=0.55, color=kol, color_discrete_map=warna, title=judul)
+        fig.update_traces(textinfo="percent+label", showlegend=False)
+        kolom.plotly_chart(_gaya(fig, 300), width="stretch")
+    produk = df["Rekomendasi_Produk"].dropna().str.split(r" \| ").explode().value_counts().head(5)
+    st.markdown("**💡 Rekomendasi daur ulang terbanyak:** " + "".join(
+        _badge(f"{_ikon_produk(p)} {p}", "#2E7D32") for p in produk.index), unsafe_allow_html=True)
+    st.dataframe(df[["Teks", "Pred_Sentimen", "Pred_Jenis", "Pred_Masalah", "Sarkasme", "Confidence",
+                     "Confidence_Reasoning"]].rename(columns={
+                         "Pred_Sentimen": "Sentimen", "Pred_Jenis": "Jenis", "Pred_Masalah": "Masalah",
+                         "Confidence": "Keyakinan", "Confidence_Reasoning": "Alasan AI"}),
+                 hide_index=True, width="stretch")
+    st.download_button("⬇️ Unduh hasil (CSV)", df.to_csv(index=False).encode("utf-8-sig"), "hasil_link.csv",
+                       "text/csv")
+
+
+def _cek_teks(st, cfg):
+    ss = st.session_state
 
     def _isi_contoh():
         if ss.get("cl_contoh"):
@@ -2267,6 +2514,8 @@ def halaman_cek_laporan():
         if st.button("🔍 Analisis laporan", type="primary", disabled=not teks.strip(), width="stretch"):
             with st.spinner("SI-BERSIH sedang membaca laporan..."):
                 ss["cl_hasil"] = analisis_laporan(teks, cfg, mentah=True)
+                ss["cl_teks_dianalisis"] = teks
+                ss.pop("cl_agen", None)
 
     h = ss.get("cl_hasil")
     if h:
@@ -2294,10 +2543,33 @@ def halaman_cek_laporan():
                                           ("Respons mentah LLM", h.get("_mentah")),
                                           ("Prompt yang dikirim", h.get("_prompt"))) if v},
                        metode=h.get("_metode", ""), key="xai_laporan")
+        _agen_ui(st, cfg, h)
 
-    st.write("")
-    with st.expander("🧪 Lab eksperimen (untuk dosen): bandingkan prompt & model", expanded=bool(ss.get("ep"))):
-        _lab_eksperimen(st, cfg)
+
+def _agen_ui(st, cfg, h):
+    ss = st.session_state
+    with st.container(key="kartu_agen"):
+        st.markdown("#### 🤖 Agen tindak lanjut")
+        st.caption("Agen memeriksa wilayah laporan, data resmi DLHD, dan laporan serupa, lalu menyusun tindak lanjut "
+                   "untuk petugas beserta balasan untuk warga.")
+        if st.button("▶️ Jalankan agen", key="agen_jalan"):
+            with st.spinner("Agen sedang bekerja..."):
+                ss["cl_agen"] = agen_tindak_lanjut(ss.get("cl_teks_dianalisis", ""), h, cfg)
+        a = ss.get("cl_agen")
+        if not a:
+            return
+        _status_metode(st, a)
+        warna = {"Tinggi": "#C62828", "Sedang": "#EF6C00", "Rendah": "#2E7D32"}[a["prioritas"]]
+        st.markdown(_badge(f"Prioritas {a['prioritas']}", warna) + _badge(f"⏱️ {a.get('batas_waktu', '-')}", "#1565C0")
+                    + (_badge("👤 Perlu verifikasi petugas", "#6A1B9A") if a["perlu_verifikasi_manusia"] else ""),
+                    unsafe_allow_html=True)
+        st.markdown(f"**Diteruskan ke:** {a.get('instansi_tujuan', '-')}  \n**Alasan:** {a.get('alasan_prioritas', '-')}")
+        st.markdown(_langkah_html(a["tindakan"]), unsafe_allow_html=True)
+        st.info(f"💬 **Balasan untuk warga:** {a.get('balasan_untuk_warga', '-')}")
+        with st.expander("Langkah kerja agen (observasi → alat → keputusan)"):
+            for i, (nama, isi) in enumerate(a["_langkah"], start=1):
+                st.markdown(f"{i}. **{nama}** — {isi}")
+            st.caption(f"Keyakinan agen {a['confidence']}% · {a.get('confidence_reasoning', '')} · {a['_metode']}")
 
 
 def _lab_eksperimen(st, cfg):
@@ -2454,10 +2726,14 @@ def halaman_dashboard():
         gagal = df[(df["Label_Sentimen"] != df["Pred_Sentimen"]) | (df["Label_Jenis_Sampah"] != df["Pred_Jenis"])]
         if kat:
             gagal = gagal[gagal["Kategori_Teks"].isin(kat)]
-        st.dataframe(gagal[["Kategori_Teks", "Teks_Laporan", "Label_Sentimen", "Pred_Sentimen", "Confidence",
-                            "Confidence_Reasoning"]].rename(columns={
-                                "Kategori_Teks": "Jenis kalimat", "Teks_Laporan": "Laporan", "Label_Sentimen": "Seharusnya",
-                                "Pred_Sentimen": "Jawaban AI", "Confidence_Reasoning": "Alasan AI"}),
+        gagal = gagal.assign(Kesalahan=[
+            "; ".join(f"{n}: {a} → {b}" for n, a, b in (("Sentimen", r.Label_Sentimen, r.Pred_Sentimen),
+                                                         ("Jenis", r.Label_Jenis_Sampah, r.Pred_Jenis)) if a != b)
+            for r in gagal.itertuples()])
+        st.dataframe(gagal[["Kategori_Teks", "Teks_Laporan", "Kesalahan", "Confidence", "Confidence_Reasoning"]]
+                     .rename(columns={"Kategori_Teks": "Jenis kalimat", "Teks_Laporan": "Laporan",
+                                      "Kesalahan": "Kesalahan (benar → jawaban AI)",
+                                      "Confidence_Reasoning": "Alasan AI"}),
                      hide_index=True, width="stretch")
         st.caption("Metode yang dipakai: " + ", ".join(f"{m} ({n})" for m, n in df["Metode"].value_counts().items()))
 

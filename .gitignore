@@ -8,3 +8,5 @@ __pycache__/
 standar/
 *.docx
 Draft_Laporan_SI-BERSIH.md
+gambar_laporan/
+*.pdf

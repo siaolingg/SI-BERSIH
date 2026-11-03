@@ -12,6 +12,7 @@ LLM-Based Social Problem Analysis and Recommendation System · Pengelolaan Sampa
 | `fishbone_sibersih.png` | Gambar fishbone untuk laporan |
 | `.streamlit/config.toml` | Tema warna hijau untuk tampilan web |
 | `Draft_Laporan_SI-BERSIH.md` | Draf teks laporan PDF |
+| `Laporan_SI-BERSIH.docx` / `.pdf` | Laporan tugas (lengkapi bagian bertanda [ISI] lalu ekspor ulang ke PDF) |
 
 ## Menjalankan (Windows)
 ```
@@ -25,7 +26,7 @@ python app.py batch --limit 50    (uji 50 laporan dulu, lalu jalankan lagi tanpa
 python app.py evaluate
 streamlit run app.py
 ```
-Aplikasi web punya 3 halaman: **Daur Ulang Sampah** (alur 4 langkah: jenis → isi → pilih ide → cara membuat), **Cek Laporan Warga**, dan **Dashboard**.
+Aplikasi web punya 3 halaman: **Daur Ulang Sampah** (alur 4 langkah: jenis → isi → pilih ide → cara membuat), **Cek Laporan Warga** (teks atau **link website** yang teksnya diambil otomatis, plus **agen tindak lanjut**), dan **Dashboard**.
 
 Tanpa API key, sistem otomatis memakai baseline rule-based (`python app.py batch --provider offline`).
 Jika muncul error model tidak ditemukan, ganti `GEMINI_MODEL` di `.env` dengan nama model yang tersedia di AI Studio.

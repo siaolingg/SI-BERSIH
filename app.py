@@ -1152,8 +1152,7 @@ def _kuota_harian_habis(error) -> bool:
     ))
 
 
-def panggil_llm(cfg: LLMConfig, system: str, prompt: str, percobaan: int = 3):
-    """Panggil LLM dan kembalikan JSON hasil parsing. Retry dengan backoff untuk rate limit (429)."""
+def _panggil_satu_model(cfg: LLMConfig, system: str, prompt: str, percobaan: int):
     fungsi = _panggil_gemini if cfg.provider == "Gemini" else _panggil_openai_compatible
     error_terakhir = None
     for i in range(percobaan):
@@ -1168,6 +1167,46 @@ def panggil_llm(cfg: LLMConfig, system: str, prompt: str, percobaan: int = 3):
                 break  # kesalahan konfigurasi: tidak ada gunanya mengulang
             time.sleep((20 if "429" in pesan or "quota" in pesan or "rate" in pesan else 3) * (i + 1))
     raise RuntimeError(f"Gagal memanggil {cfg.provider} ({cfg.model}): {error_terakhir}")
+
+
+# Kuota gratis Gemini dihitung PER MODEL (mis. 20 permintaan/hari untuk model Flash terbaru). Bila kuota model utama
+# habis, SI-BERSIH otomatis mencoba model Gemini cadangan sebelum jatuh ke mode offline. Daftar bisa diubah lewat
+# .env / Secrets: GEMINI_MODEL_CADANGAN = "model-a,model-b". Nama model yang tidak tersedia dilewati otomatis.
+GEMINI_CADANGAN = [m.strip() for m in _pengaturan(
+    "GEMINI_MODEL_CADANGAN", "gemini-flash-lite-latest,gemini-2.5-flash,gemini-2.5-flash-lite").split(",") if m.strip()]
+_KUOTA_HABIS: dict[str, float] = {}   # model -> waktu (epoch) kuotanya diperkirakan pulih
+
+
+def _waktu_pulih(error) -> float:
+    detik = re.search(r"retrydelay'?:\s*'?(\d+)", str(error).lower())
+    return time.time() + (int(detik.group(1)) if detik else 3600)
+
+
+def panggil_llm(cfg: LLMConfig, system: str, prompt: str, percobaan: int = 3):
+    """Panggil LLM dan kembalikan JSON hasil parsing. Retry dengan backoff untuk rate limit (429).
+    Untuk Gemini: bila kuota harian model habis / model tidak tersedia, coba model cadangan. Model yang berhasil
+    disimpan ke cfg.model sehingga label metode menunjukkan model yang benar-benar dipakai."""
+    if cfg.provider != "Gemini":
+        return _panggil_satu_model(cfg, system, prompt, percobaan)
+    urutan = [cfg.model] + [m for m in GEMINI_CADANGAN if m != cfg.model]
+    tersedia = [m for m in urutan if _KUOTA_HABIS.get(m, 0) < time.time()] or urutan[:1]
+    error_terakhir = None
+    for model in tersedia:
+        coba = LLMConfig(cfg.provider, cfg.api_key, model, cfg.base_url, cfg.temperature)
+        try:
+            hasil = _panggil_satu_model(coba, system, prompt, percobaan)
+            cfg.model = model
+            return hasil
+        except RuntimeError as e:
+            error_terakhir = e
+            pesan = str(e).lower()
+            if _kuota_harian_habis(pesan):
+                _KUOTA_HABIS[model] = _waktu_pulih(pesan)
+            elif any(s in pesan for s in ("not found", "404", "is not supported")):
+                _KUOTA_HABIS[model] = time.time() + 86400   # model tidak tersedia untuk API key ini
+            else:
+                raise  # API key salah / internet putus: model lain juga akan gagal
+    raise error_terakhir
 
 
 # =============================================================================
@@ -1825,7 +1864,12 @@ def _langkah_html(langkah: list[str]) -> str:
 
 def _status_metode(st, hasil: dict):
     if hasil.get("_error"):
-        st.warning("AI online tidak bisa dihubungi, jadi hasil ini dibuat dengan mode offline.")
+        if _kuota_harian_habis(hasil["_error"]) or "resource_exhausted" in hasil["_error"].lower():
+            st.warning("**Kuota gratis Gemini hari ini sudah habis** (API key Anda benar; Google membatasi jumlah "
+                       "permintaan gratis per hari untuk tiap model, dan model cadangan juga sudah habis). Hasil ini "
+                       "sementara dibuat dengan mode offline. Kuota pulih otomatis setiap hari sekitar pukul 15.00 WIB.")
+        else:
+            st.warning("AI online tidak bisa dihubungi, jadi hasil ini dibuat dengan mode offline.")
         st.caption(f"Detail: {hasil['_error'][:200]}")
 
 
@@ -2323,9 +2367,12 @@ def halaman_dashboard():
 
     df = pd.read_csv(HASIL_PATH)
     df["Tanggal"] = pd.to_datetime(df["Tanggal"])
-    if cfg.pakai_llm and df["Metode"].str.contains("Rule-based|rule-based").any():
-        st.warning("Sebagian hasil di dashboard dibuat dengan **mode offline**, bukan Gemini. Hapus hasil di tab "
-                   "⚙️ Kelola Data lalu analisis ulang agar semua hasil berasal dari Gemini.")
+    offline = df["Metode"].astype(str).str.contains("Rule-based|rule-based")
+    if cfg.pakai_llm and offline.any():
+        st.warning(f"**{offline.sum()} dari {len(df)} hasil** dibuat dengan mode offline karena kuota gratis Gemini "
+                   "habis saat analisis dijalankan. Hasil Gemini yang sudah ada tetap dipakai. Untuk melengkapinya, "
+                   "jalankan di laptop `python app.py batch --ulang-fallback --batch-size 20` setelah kuota pulih, "
+                   "lalu push `hasil_analisis.csv` ke GitHub.")
     wilayah = st.multiselect("📍 Wilayah", sorted(df["Kabupaten_Kota"].unique()), placeholder="Semua kabupaten/kota")
     if wilayah:
         df = df[df["Kabupaten_Kota"].isin(wilayah)]

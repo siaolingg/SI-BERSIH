@@ -1264,8 +1264,20 @@ def _panggil_satu_model(cfg: LLMConfig, system: str, prompt: str, percobaan: int
                 break  # kuota harian tidak bisa pulih dengan retry
             if any(s in pesan for s in ("api key", "api_key", "401", "403", "permission", "not found", "404")):
                 break  # kesalahan konfigurasi: tidak ada gunanya mengulang
+            if _server_sibuk(pesan):
+                if i >= 1:
+                    break  # server model ini sedang penuh: lebih cepat pindah ke model cadangan
+                time.sleep(2)
+                continue
             time.sleep((20 if "429" in pesan or "quota" in pesan or "rate" in pesan else 3) * (i + 1))
     raise RuntimeError(f"Gagal memanggil {cfg.provider} ({cfg.model}): {error_terakhir}")
+
+
+def _server_sibuk(error) -> bool:
+    """503 UNAVAILABLE / 500 INTERNAL / overloaded: server Google sedang penuh (sementara, bukan salah kita)."""
+    pesan = str(error).lower()
+    return bool(re.search(r"\b(500|503)\b", pesan)) or any(
+        s in pesan for s in ("unavailable", "overloaded", "high demand", "internal error"))
 
 
 # Kuota gratis Gemini dihitung PER MODEL (mis. 20 permintaan/hari untuk model Flash terbaru). Bila kuota model utama
@@ -1283,7 +1295,8 @@ def _waktu_pulih(error) -> float:
 
 def panggil_llm(cfg: LLMConfig, system: str, prompt: str, percobaan: int = 3):
     """Panggil LLM dan kembalikan JSON hasil parsing. Retry dengan backoff untuk rate limit (429).
-    Untuk Gemini: bila kuota harian model habis / model tidak tersedia, coba model cadangan. Model yang berhasil
+    Untuk Gemini: bila kuota harian model habis, server model sibuk (503), atau model tidak tersedia, coba model
+    cadangan. Model yang berhasil
     disimpan ke cfg.model sehingga label metode menunjukkan model yang benar-benar dipakai."""
     if cfg.provider != "Gemini":
         return _panggil_satu_model(cfg, system, prompt, percobaan)
@@ -1303,6 +1316,8 @@ def panggil_llm(cfg: LLMConfig, system: str, prompt: str, percobaan: int = 3):
                 _KUOTA_HABIS[model] = _waktu_pulih(pesan)
             elif any(s in pesan for s in ("not found", "404", "is not supported")):
                 _KUOTA_HABIS[model] = time.time() + 86400   # model tidak tersedia untuk API key ini
+            elif _server_sibuk(pesan):
+                _KUOTA_HABIS[model] = time.time() + 120     # model sibuk: istirahatkan 2 menit, pakai cadangan
             else:
                 raise  # API key salah / internet putus: model lain juga akan gagal
     raise error_terakhir
@@ -2048,6 +2063,10 @@ def _status_metode(st, hasil: dict):
             st.warning("**Kuota gratis Gemini hari ini sudah habis** (API key Anda benar; Google membatasi jumlah "
                        "permintaan gratis per hari untuk tiap model, dan model cadangan juga sudah habis). Hasil ini "
                        "sementara dibuat dengan mode offline. Kuota pulih otomatis setiap hari sekitar pukul 15.00 WIB.")
+        elif _server_sibuk(hasil["_error"]):
+            st.warning("**Server Gemini sedang sibuk** (error 503 dari Google, bukan kesalahan aplikasi atau API key). "
+                       "Semua model Gemini cadangan juga sedang penuh, jadi hasil ini sementara dibuat dengan mode "
+                       "offline. Tunggu 1–2 menit lalu klik tombolnya lagi.")
         else:
             st.warning("AI online tidak bisa dihubungi, jadi hasil ini dibuat dengan mode offline.")
         st.caption(f"Detail: {hasil['_error'][:200]}")

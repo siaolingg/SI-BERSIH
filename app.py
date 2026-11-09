@@ -1220,8 +1220,8 @@ def ekstrak_json(teks: str):
 def _panggil_gemini(cfg: LLMConfig, system: str, prompt: str) -> str:
     from google import genai
     from google.genai import types
-
-    client = genai.Client(api_key=cfg.api_key)
+    # Wajib v1beta: system_instruction & mode JSON ditolak di v1, padahal v1 adalah versi bawaan SDK 3.x.
+    client = genai.Client(api_key=cfg.api_key, http_options=types.HttpOptions(api_version="v1beta"))
     resp = client.models.generate_content(
         model=cfg.model,
         contents=prompt,
@@ -1262,7 +1262,7 @@ def _panggil_satu_model(cfg: LLMConfig, system: str, prompt: str, percobaan: int
             pesan = str(e).lower()
             if _kuota_harian_habis(pesan):
                 break  # kuota harian tidak bisa pulih dengan retry
-            if any(s in pesan for s in ("api key", "api_key", "401", "403", "permission", "not found", "404")):
+            if any(s in pesan for s in ("api key", "api_key", "401", "403", "permission", "not found", "404", "invalid_argument")):
                 break  # kesalahan konfigurasi: tidak ada gunanya mengulang
             if _server_sibuk(pesan):
                 if i >= 1:
